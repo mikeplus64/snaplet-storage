@@ -10,6 +10,8 @@ import Control.Lens
 import qualified Data.ByteString.Char8 as B
 import qualified Data.HashMap.Strict   as H
 import           Data.IORef
+import           Data.Monoid
+import qualified Data.Set              as Set
 import           Data.Time
 
 import qualified Data.Foldable    as F
@@ -26,10 +28,26 @@ data Store a = Store
   , storeObjects :: !(IORef (H.HashMap B.ByteString (Dated a)))
   }
 
-data Dated a = Dated { _date :: !UTCTime, _object :: !a }
+newtype ModTimes = ModTimes (Set.Set UTCTime)
+  deriving (Eq, Show)
+
+instance Ord ModTimes where
+  compare (ModTimes a) (ModTimes b)
+    | Set.null a && Set.null b = EQ
+    | Set.null a               = LT
+    | Set.null b               = GT
+    | otherwise                = compare (Set.findMax a) (Set.findMax b)
+
+mergeModTimes :: ModTimes -> ModTimes -> ModTimes
+mergeModTimes (ModTimes a) (ModTimes b) = ModTimes (Set.union a b)
+
+data Dated a = Dated { _date :: !ModTimes, _object :: !a }
   deriving (Show, Eq)
 
 makeLenses ''Dated
+
+--------------------------------------------------------------------------------
+-- Main logic
 
 foldTree :: AnchoredDirTree v -> H.HashMap B.ByteString v
 foldTree = F.foldl' (\h (k,v) -> H.insert (B.pack k) v h) H.empty . zipPaths
@@ -40,7 +58,8 @@ objectTree
   -> IO (H.HashMap B.ByteString (Dated a))
 objectTree loadObj root = foldTree <$> readDirectoryWith loadDatedObj root
  where
-  loadDatedObj path = Dated <$> getModificationTime path <*> loadObj path
+  getModTime   path = ModTimes . Set.singleton <$> getModificationTime path
+  loadDatedObj path = Dated <$> getModTime path <*> loadObj path
 
 data Load a
   = Load !FilePath
@@ -55,7 +74,7 @@ findUpdates m0 m1 =
   H.unionWith
     (\(Dated t0 o0) (Dated t1 o1) ->
        if t1 > t0
-       then Dated t1 o1
+       then Dated (mergeModTimes t0 t1) o1
        else Dated t0 o0)
     -- remove entries not in the new tree, and make them both the same type.
     (traverse.object %~ Keep $! H.intersection m0 m1)
