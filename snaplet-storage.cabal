@@ -19,6 +19,7 @@ library
   exposed-modules:     Snap.Snaplet.Storage
   build-depends:       base >=4.7 && <5
                      , directory-tree
+                     , directory
                      , text
                      , bytestring
                      , lens
