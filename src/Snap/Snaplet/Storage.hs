@@ -8,8 +8,8 @@ import Control.Applicative
 import Control.Lens
 
 import qualified Data.ByteString.Char8 as B
+import qualified Data.HashMap.Strict   as H
 import           Data.IORef
-import qualified Data.Map.Strict       as M
 import           Data.Time
 
 import qualified Data.Foldable    as F
@@ -21,7 +21,7 @@ import System.Directory.Tree
 data Store a = Store
   { rootDir      :: !FilePath
   , loadObject   :: !(FilePath -> IO a)
-  , storeObjects :: !(IORef (M.Map B.ByteString (Dated a)))
+  , storeObjects :: !(IORef (H.HashMap B.ByteString (Dated a)))
   }
 
 data Dated a = Dated { _date :: !UTCTime, _object :: !a }
@@ -29,43 +29,45 @@ data Dated a = Dated { _date :: !UTCTime, _object :: !a }
 
 makeLenses ''Dated
 
-foldTree :: AnchoredDirTree v -> M.Map B.ByteString v
-foldTree = F.foldl' (\h (k,v) -> M.insert (B.pack k) v h) M.empty . zipPaths
+foldTree :: AnchoredDirTree v -> H.HashMap B.ByteString v
+foldTree = F.foldl' (\h (k,v) -> H.insert (B.pack k) v h) H.empty . zipPaths
 
 objectTree
   :: (FilePath -> IO a)
   -> FilePath
-  -> IO (M.Map B.ByteString (Dated a))
+  -> IO (H.HashMap B.ByteString (Dated a))
 objectTree loadObj root = foldTree <$> readDirectoryWith loadDatedObj root
  where
   loadDatedObj path = Dated <$> getModificationTime path <*> loadObj path
 
 data Load a
-  = Reload !FilePath
+  = Load !FilePath
   | Keep !a
  deriving (Show, Eq, Ord)
 
 findUpdates
-  :: M.Map B.ByteString (Dated a)
-  -> M.Map B.ByteString (Dated FilePath)
-  -> M.Map B.ByteString (Dated (Load a))
-findUpdates = M.mergeWithKey
-  (\_ (Dated t0 o0) (Dated t1 path) -> Just $!
-     if t1 > t0
-     then Dated t1 (Reload path)
-     else Dated t0 (Keep o0))
-  (traverse.object %~ Keep)
-  (traverse.object %~ Reload)
+  :: H.HashMap B.ByteString (Dated a)
+  -> H.HashMap B.ByteString (Dated FilePath)
+  -> H.HashMap B.ByteString (Dated (Load a))
+findUpdates m0 m1 =
+  H.unionWith
+    (\(Dated t0 o0) (Dated t1 o1) ->
+       if t1 > t0
+       then Dated t1 o1
+       else Dated t0 o0)
+    -- remove entries not in the new tree, and make them both the same type.
+    (traverse.object %~ Keep $! H.difference m0 m1)
+    (traverse.object %~ Load $! m1)
 
 loadUpdates
   :: Applicative f
   => (FilePath -> f a)
-  -> M.Map B.ByteString (Dated (Load a))
-  -> f (M.Map B.ByteString (Dated a))
+  -> H.HashMap B.ByteString (Dated (Load a))
+  -> f (H.HashMap B.ByteString (Dated a))
 loadUpdates load = F.traverse $ \(Dated t a) -> do
   case a of
-    Reload k -> Dated t <$> load k
-    Keep   x -> pure $! Dated t x
+    Load k -> Dated t <$> load k
+    Keep x -> pure $! Dated t x
 
 updateStore :: Store a -> IO ()
 updateStore store = do
@@ -76,7 +78,10 @@ updateStore store = do
 
 newStore :: FilePath -> (FilePath -> IO a) -> IO (Store a)
 newStore root load = do
-  objects <- newIORef M.empty
+  objects <- newIORef H.empty
   let store = Store root load objects
   updateStore store
   return store
+
+lookupStore :: B.ByteString -> Store a -> IO (Maybe (Dated a))
+lookupStore path store = H.lookup path <$> readIORef (storeObjects store)
