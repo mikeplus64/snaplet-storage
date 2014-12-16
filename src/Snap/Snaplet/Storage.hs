@@ -18,6 +18,8 @@ import qualified Data.Traversable as F
 import System.Directory
 import System.Directory.Tree
 
+import Debug.Trace
+
 data Store a = Store
   { rootDir      :: !FilePath
   , loadObject   :: !(FilePath -> IO a)
@@ -56,7 +58,7 @@ findUpdates m0 m1 =
        then Dated t1 o1
        else Dated t0 o0)
     -- remove entries not in the new tree, and make them both the same type.
-    (traverse.object %~ Keep $! H.difference m0 m1)
+    (traverse.object %~ Keep $! H.intersection m0 m1)
     (traverse.object %~ Load $! m1)
 
 loadUpdates
@@ -79,7 +81,9 @@ updateStore store = do
 newStore :: FilePath -> (FilePath -> IO a) -> IO (Store a)
 newStore root load = do
   objects <- newIORef H.empty
-  let store = Store root load objects
+  let
+    load' = \p -> print p >> load p
+    store = Store root load' objects
   updateStore store
   return store
 
