@@ -24,7 +24,6 @@ import           System.Directory.Tree
 
 data Store a = Store
   { storeObjects    :: !(IORef (H.HashMap B.ByteString (Dated a)))
-  , _scurrentObject :: Maybe (Dated a)
   }
 
 newtype ModTimes = ModTimes { _allModTimes :: Set.Set UTCTime }
@@ -53,7 +52,6 @@ makeLensesFor
   [("object", "_object")
   ,("date", "_date")] ''Dated
 
-makeLenses ''Store
 makeLenses ''ModTimes
 
 modTimes :: Lens' (Dated a) (Set.Set UTCTime)
@@ -132,9 +130,6 @@ lookupStore spath store = H.lookup spath <$> readIORef (storeObjects store)
 
 class HasStore b a | b -> a where
   storeLens :: SnapletLens (Snaplet b) (Store a)
-
-currentObject :: HasStore b a => Handler b v (Maybe (Dated a))
-currentObject = withTop' storeLens (use scurrentObject)
 
 data StoreConfig a = StoreConfig
   { storeRoot  :: !FilePath
