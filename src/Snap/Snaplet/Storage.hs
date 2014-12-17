@@ -167,13 +167,5 @@ storeInit config = makeSnaplet "store" "Snap store init" Nothing $ do
 
   onUnload (killThread reloader)
 
-  addRoutes
-    [("", do
-      spath <- getsRequest rqPathInfo
-      obj   <- liftIO (lookupStore spath store)
-      scurrentObject .= obj
-      pass)
-    ]
-
   return store
 
