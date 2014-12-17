@@ -3,6 +3,7 @@
 {-# LANGUAGE MultiParamTypeClasses     #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE OverloadedStrings         #-}
+{-# LANGUAGE RankNTypes                #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
 {-# LANGUAGE TemplateHaskell           #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
@@ -26,7 +27,7 @@ data Store a = Store
   , _scurrentObject :: Maybe (Dated a)
   }
 
-newtype ModTimes = ModTimes (Set.Set UTCTime)
+newtype ModTimes = ModTimes { _allModTimes :: Set.Set UTCTime }
   deriving (Eq, Show)
 
 instance Ord ModTimes where
@@ -44,11 +45,19 @@ instance Ord ModTimes where
 mergeModTimes :: ModTimes -> ModTimes -> ModTimes
 mergeModTimes (ModTimes a) (ModTimes b) = ModTimes (Set.union a b)
 
-data Dated a = Dated { _ddate :: !ModTimes, _dobject :: !a }
+data Dated a = Dated { date :: !ModTimes, object :: !a }
   deriving (Show, Eq)
 
+
+makeLensesFor
+  [("object", "_object")
+  ,("date", "_date")] ''Dated
+
 makeLenses ''Store
-makeLenses ''Dated
+makeLenses ''ModTimes
+
+modTimes :: Lens' (Dated a) (Set.Set UTCTime)
+modTimes = _date . allModTimes
 
 --------------------------------------------------------------------------------
 -- Main logic
@@ -81,8 +90,8 @@ findUpdates m0 m1 =
        then Dated (mergeModTimes t0 t1) o1
        else Dated t0 o0)
     -- remove entries not in the new tree, and make them both the same type.
-    (traverse.dobject %~ Keep $ H.intersection m0 m1)
-    (traverse.dobject %~ Load $ m1)
+    (traverse._object %~ Keep $ H.intersection m0 m1)
+    (traverse._object %~ Load $ m1)
 
 loadUpdates
   :: forall f a. (Applicative f, Monad f)
@@ -133,6 +142,19 @@ data StoreConfig a = StoreConfig
   , pollEvery  :: !DiffTime
   }
 
+storeUse :: HasStore b a => B.ByteString -> Getter (Dated a) r -> Handler b v r
+storeUse key l = withTop' storeLens $ do
+  obj <- liftIO . lookupStore key =<< get
+  case obj of
+    Just o  -> return (view l o)
+    Nothing -> pass
+
+storeGet :: HasStore b a => B.ByteString -> Handler b v (Dated a)
+storeGet key = storeUse key id
+
+storeObject :: HasStore b a => Handler b v (Dated a)
+storeObject = storeGet =<< getsRequest rqPathInfo
+
 storeInit
   :: HasStore b a
   => StoreConfig a
@@ -147,9 +169,9 @@ storeInit config = makeSnaplet "store" "Snap store init" Nothing $ do
 
   addRoutes
     [("", do
-      spath  <- getsRequest rqPathInfo
-      object <- liftIO (lookupStore spath store)
-      scurrentObject .= object
+      spath <- getsRequest rqPathInfo
+      obj   <- liftIO (lookupStore spath store)
+      scurrentObject .= obj
       pass)
     ]
 
