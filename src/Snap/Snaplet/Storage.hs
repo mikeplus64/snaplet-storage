@@ -36,10 +36,9 @@ import           Data.Time
 import           Snap
 import           System.Directory
 import           System.Directory.Tree
-import qualified System.IO             as IO
 
-data Store a = Store
-  { storeObjects :: !(IORef (H.HashMap B.ByteString (Dated a)))
+newtype Store a = Store
+  { storeObjects :: IORef (H.HashMap B.ByteString (Dated a))
   }
 
 -- | Instead of storing just the latest time for when something was updated
@@ -171,7 +170,8 @@ data StoreConfig a = StoreConfig
   , readObject :: !(FilePath -> IO (Maybe a))
     -- | The interval to poll for updates. Measured in seconds.
   , pollEvery  :: !DiffTime
-  , logUpdates :: !(Maybe IO.Handle)
+    -- | How to log messages.
+  , logUpdate  :: !(String -> IO ())
   }
 
 -- | A store for all .html files in the root directory and its ancestors
@@ -183,7 +183,7 @@ htmlStore root = StoreConfig
       then Just <$> B.readFile fs
       else return Nothing
   , pollEvery  = 60 -- 1 minute
-  , logUpdates = Just IO.stdout
+  , logUpdate  = putStrLn
   }
 
 -- | Use a lens on an object in the store. Calls 'pass' if the object isn't
@@ -203,9 +203,11 @@ storeUse key l = withTop' storeLens $ do
     Just o  -> return (view l o)
     Nothing -> pass
 
+-- | Get the 'Dated' object from some path in the storage.
 storeGet :: HasStore b a => B.ByteString -> Handler b v (Dated a)
 storeGet key = storeUse key id
 
+-- | Try read the object from the current request's 'rqPathInfo'.
 storeObject :: HasStore b a => Handler b v (Dated a)
 storeObject = storeGet =<< getsRequest rqPathInfo
 
@@ -214,18 +216,14 @@ storeInit
   => StoreConfig a
   -> SnapletInit b (Store a)
 storeInit config = makeSnaplet "store" "Snap store init" Nothing $ do
-  let
-    log_ :: String -> IO ()
-    log_ t = F.for_ (logUpdates config) (\h -> IO.hPutStrLn h t)
-
   store    <- liftIO (newStore config)
   reloader <- liftIO . forkIO . forever $ do
     threadDelay $! floor (1000000 * toRational (pollEvery config))
-    log_ "snaplet-storage: Updating store ..."
+    logUpdate config "snaplet-storage: Updating store ..."
     (l, k) <- updateStore config store
-    log_ $ "snaplet-storage: Loaded objects: " ++ show l
-    log_ $ "snaplet-storage: Kept objects: " ++ show k
-    log_ "snaplet-storage: Done"
+    logUpdate config $ "snaplet-storage: Loaded objects: " ++ show l
+    logUpdate config $ "snaplet-storage: Kept objects: " ++ show k
+    logUpdate config "snaplet-storage: Done"
 
   onUnload (killThread reloader)
 
