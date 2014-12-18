@@ -7,25 +7,43 @@
 {-# LANGUAGE ScopedTypeVariables       #-}
 {-# LANGUAGE TemplateHaskell           #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
-module Snap.Snaplet.Storage where
+module Snap.Snaplet.Storage
+  ( HasStore(..)
+  , StoreConfig(..)
+  , htmlStore
+    -- * Types
+  , Store
+  , Dated(..), ModTimes, times
+    -- * Snap integratoin
+  , storeInit
+  , storeUse
+  , storeGet
+  , storeObject
+    -- * IO functions
+  , newStore, updateStore, lookupStore
+  ) where
 import           Control.Applicative
 import           Control.Concurrent
 import           Control.Lens
-import qualified Data.ByteString.Char8 as B
+import qualified Data.ByteString       as B
 import qualified Data.Foldable         as F
 import qualified Data.HashMap.Strict   as H
 import           Data.IORef
+import           Data.List             (isSuffixOf)
 import qualified Data.Set              as Set
+import           Data.String
 import           Data.Time
-import qualified Data.Traversable      as F
 import           Snap
 import           System.Directory
 import           System.Directory.Tree
+import qualified System.IO             as IO
 
 data Store a = Store
-  { storeObjects    :: !(IORef (H.HashMap B.ByteString (Dated a)))
+  { storeObjects :: !(IORef (H.HashMap B.ByteString (Dated a)))
   }
 
+-- | Instead of storing just the latest time for when something was updated
+-- , we store every time that a store object was modified.
 newtype ModTimes = ModTimes { _allModTimes :: Set.Set UTCTime }
   deriving (Eq, Show)
 
@@ -47,21 +65,23 @@ mergeModTimes (ModTimes a) (ModTimes b) = ModTimes (Set.union a b)
 data Dated a = Dated { date :: !ModTimes, object :: !a }
   deriving (Show, Eq)
 
-
 makeLensesFor
   [("object", "_object")
-  ,("date", "_date")] ''Dated
+  ,("date", "_date")
+  ] ''Dated
 
 makeLenses ''ModTimes
 
-modTimes :: Lens' (Dated a) (Set.Set UTCTime)
-modTimes = _date . allModTimes
+-- | A lens from the dates of a 'Dated' object to a (descending) list of
+-- modification times.
+times :: Lens' (Dated a) [UTCTime]
+times = _date . allModTimes . iso Set.toDescList Set.fromList
 
 --------------------------------------------------------------------------------
 -- Main logic
 
 foldTree :: AnchoredDirTree v -> H.HashMap B.ByteString v
-foldTree = F.foldl' (\h (k,v) -> H.insert (B.pack k) v h) H.empty . zipPaths
+foldTree = F.foldl' (\h (k,v) -> H.insert (fromString k) v h) H.empty . zipPaths
 
 objectTree
   :: (FilePath -> IO a)
@@ -91,35 +111,50 @@ findUpdates m0 m1 =
     (traverse._object %~ Keep $ H.intersection m0 m1)
     (traverse._object %~ Load $ m1)
 
+data Update a = Update
+  { _loaded  :: !Int
+  , _kept    :: !Int
+  , _rebuilt :: !(H.HashMap B.ByteString (Dated a))
+  }
+
+makeLenses ''Update
+
 loadUpdates
   :: forall f a. (Applicative f, Monad f)
   => (FilePath -> f (Maybe a))
   -> H.HashMap B.ByteString (Dated (Load a))
-  -> f (H.HashMap B.ByteString (Dated a))
-loadUpdates load hmap = execStateT (insertEach hmap) H.empty
+  -> f (Update a)
+loadUpdates load hmap = execStateT (insertEach hmap) (Update 0 0 H.empty)
  where
-  insertEach
-    :: H.HashMap B.ByteString (Dated (Load a))
-    -> StateT (H.HashMap B.ByteString (Dated a)) f ()
+  insertEach :: H.HashMap B.ByteString (Dated (Load a))
+             -> StateT (Update a) f ()
   insertEach = itraverse_ $ \key (Dated t a) ->
     case a of
       Load k -> do
-        obj <- lift (load k)
-        F.for_ obj (modify . H.insert key . Dated t)
-      Keep x -> modify (H.insert key (Dated t x))
+        mobj <- lift (load k)
+        case mobj of
+          Just obj -> do
+            loaded  += 1
+            rebuilt %= H.insert key (Dated t obj)
+          Nothing  -> return ()
+      Keep x -> do
+        kept    += 1
+        rebuilt %= H.insert key (Dated t x)
 
-updateStore :: StoreConfig a -> Store a -> IO ()
+updateStore :: StoreConfig a -> Store a -> IO (Int, Int)
 updateStore config store = do
   oldTree <- readIORef (storeObjects store)
   newTree <- objectTree return (storeRoot config)
-  objects <- loadUpdates (readObject config) $! findUpdates oldTree newTree
-  writeIORef (storeObjects store) objects
+  update  <- loadUpdates (readObject config) $! findUpdates oldTree newTree
+  writeIORef (storeObjects store) (_rebuilt update)
+  return (_loaded update, _kept update)
 
 newStore :: StoreConfig a -> IO (Store a)
 newStore config = do
   objects <- newIORef H.empty
-  let store = Store objects Nothing
-  updateStore config store
+  let store = Store objects
+  updated <- updateStore config store
+  print updated
   return store
 
 lookupStore :: B.ByteString -> Store a -> IO (Maybe (Dated a))
@@ -134,10 +169,34 @@ class HasStore b a | b -> a where
 data StoreConfig a = StoreConfig
   { storeRoot  :: !FilePath
   , readObject :: !(FilePath -> IO (Maybe a))
+    -- | The interval to poll for updates. Measured in seconds.
   , pollEvery  :: !DiffTime
+  , logUpdates :: !(Maybe IO.Handle)
   }
 
-storeUse :: HasStore b a => B.ByteString -> Getter (Dated a) r -> Handler b v r
+-- | A store for all .html files in the root directory and its ancestors
+htmlStore :: FilePath -> StoreConfig B.ByteString
+htmlStore root = StoreConfig
+  { storeRoot  = root
+  , readObject = \fs ->
+      if ".html" `isSuffixOf` fs || ".htm" `isSuffixOf` fs
+      then Just <$> B.readFile fs
+      else return Nothing
+  , pollEvery  = 60 -- 1 minute
+  , logUpdates = Just IO.stdout
+  }
+
+-- | Use a lens on an object in the store. Calls 'pass' if the object isn't
+-- there.
+--
+-- Example usage:
+--
+-- @ storeUse "things/stuff.html" (times.latest) @
+storeUse
+  :: HasStore b a
+  => B.ByteString       -- ^ the key to the object
+  -> Getter (Dated a) r -- ^ the lens
+  -> Handler b v r
 storeUse key l = withTop' storeLens $ do
   obj <- liftIO . lookupStore key =<< get
   case obj of
@@ -155,10 +214,18 @@ storeInit
   => StoreConfig a
   -> SnapletInit b (Store a)
 storeInit config = makeSnaplet "store" "Snap store init" Nothing $ do
+  let
+    log_ :: String -> IO ()
+    log_ t = F.for_ (logUpdates config) (\h -> IO.hPutStrLn h t)
+
   store    <- liftIO (newStore config)
   reloader <- liftIO . forkIO . forever $ do
     threadDelay $! floor (1000000 * toRational (pollEvery config))
-    updateStore config store
+    log_ "snaplet-storage: Updating store ..."
+    (l, k) <- updateStore config store
+    log_ $ "snaplet-storage: Loaded objects: " ++ show l
+    log_ $ "snaplet-storage: Kept objects: " ++ show k
+    log_ "snaplet-storage: Done"
 
   onUnload (killThread reloader)
 

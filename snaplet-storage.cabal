@@ -22,10 +22,11 @@ library
                      , directory
                      , text
                      , bytestring
-                     , lens
                      , containers
                      , unordered-containers
                      , time
+                     , lens
+                     , snap
 
   hs-source-dirs:      src
   default-language:    Haskell2010
